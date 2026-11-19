@@ -2,6 +2,8 @@
 
 **A mod manager for Skyrim Special Edition on Linux.**
 
+![Skald mod list showing enabled Skyrim mods with installer type and version columns](docs/screenshot.png)
+
 Skald installs your Skyrim mods, lets you choose options when a mod offers them, and puts
 everything into the game with one click. It works with the Steam version of Skyrim SE running
 through Proton. You don't need Wine tricks or Windows tools.
