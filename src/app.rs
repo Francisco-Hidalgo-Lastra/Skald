@@ -65,6 +65,9 @@ pub struct App {
     confirm_remove: Option<usize>,
     confirm_unmanaged: bool,
     tab: Tab,
+    /// Search text for the mod and plugin lists, kept separately per tab.
+    mod_search: String,
+    plugin_search: String,
     /// Icons read from the tools' exes (None = the exe has no icon).
     tool_icons: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
 }
@@ -100,6 +103,8 @@ impl App {
             confirm_remove: None,
             confirm_unmanaged: false,
             tab: Tab::default(),
+            mod_search: String::new(),
+            plugin_search: String::new(),
         };
         match &app.cfg.game_dir {
             Some(g) => app.info(format!("Skyrim SE: {}", g.display())),
@@ -574,6 +579,12 @@ impl App {
         let mut changed = false;
         let mut action: Option<(usize, &'static str)> = None;
         let n = self.mods.mods.len();
+        let filtering = !self.mod_search.trim().is_empty();
+        let shown: Vec<usize> = (0..n).filter(|&i| matches_search(&self.mods.mods[i].name, &self.mod_search)).collect();
+        if shown.is_empty() {
+            empty_state(ui, "🔍", "No matching mods", "Nothing in the mod list matches the search.");
+            return;
+        }
         let (mods, conflicts, selected) = (&mut self.mods.mods, &self.conflicts, &mut self.selected);
         egui_extras::TableBuilder::new(ui)
             .id_salt("mods")
@@ -596,8 +607,8 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(ROW_H, n, |mut row| {
-                    let i = row.index();
+                body.rows(ROW_H, shown.len(), |mut row| {
+                    let i = shown[row.index()];
                     let m = &mut mods[i];
                     row.set_selected(*selected == Some(i));
                     row.col(|ui| {
@@ -637,11 +648,13 @@ impl App {
                     });
                     row.col(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.add_enabled_ui(!busy, |ui| {
-                            if ui.add_enabled(i > 0, theme::icon_button("⏶")).on_hover_text("Move up").clicked() {
+                        // Moving while filtered would swap with hidden neighbours, so it waits for a clear search.
+                        let hint = if filtering { "Clear the search to reorder" } else { "" };
+                        ui.add_enabled_ui(!busy && !filtering, |ui| {
+                            if ui.add_enabled(i > 0, theme::icon_button("⏶")).on_hover_text("Move up").on_disabled_hover_text(hint).clicked() {
                                 action = Some((i, "up"));
                             }
-                            if ui.add_enabled(i + 1 < n, theme::icon_button("⏷")).on_hover_text("Move down").clicked() {
+                            if ui.add_enabled(i + 1 < n, theme::icon_button("⏷")).on_hover_text("Move down").on_disabled_hover_text(hint).clicked() {
                                 action = Some((i, "down"));
                             }
                         });
@@ -703,6 +716,24 @@ impl App {
                     self.tab = tab;
                 }
             }
+            ui.add_space(12.0);
+            let (query, hint) = match self.tab {
+                Tab::Mods => (&mut self.mod_search, "🔍 Search mods  (Ctrl+F)"),
+                Tab::Plugins => (&mut self.plugin_search, "🔍 Search plugins  (Ctrl+F)"),
+            };
+            let r = ui.add(egui::TextEdit::singleline(query).id_salt("list_search").hint_text(hint).desired_width(220.0));
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                r.request_focus();
+            }
+            if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                query.clear();
+            }
+            if !query.is_empty() {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if ui.add(theme::icon_button("✖")).on_hover_text("Clear search").clicked() {
+                    query.clear();
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let usable = match self.tab {
@@ -710,10 +741,11 @@ impl App {
                     Tab::Plugins => self.load_order.as_ref().is_some_and(|lo| lo.plugins.iter().any(|p| !p.locked)),
                 };
                 let mut set_all = None;
-                if ui.add_enabled(usable, egui::Button::new(RichText::new("Disable all").small())).clicked() {
+                let (on_label, off_label) = if self.search().trim().is_empty() { ("Enable all", "Disable all") } else { ("Enable matches", "Disable matches") };
+                if ui.add_enabled(usable, egui::Button::new(RichText::new(off_label).small())).clicked() {
                     set_all = Some(false);
                 }
-                if ui.add_enabled(usable, egui::Button::new(RichText::new("Enable all").small())).clicked() {
+                if ui.add_enabled(usable, egui::Button::new(RichText::new(on_label).small())).clicked() {
                     set_all = Some(true);
                 }
                 if let Some(on) = set_all {
@@ -766,18 +798,30 @@ impl App {
         self.save_load_order();
     }
 
-    /// Enables or disables every entry in the open tab. Base game plugins stay as they are.
+    /// Search text of the open tab.
+    fn search(&self) -> &str {
+        match self.tab {
+            Tab::Mods => &self.mod_search,
+            Tab::Plugins => &self.plugin_search,
+        }
+    }
+
+    /// Enables or disables every entry in the open tab that matches the search (all of them when it is empty).
+    /// Base game plugins stay as they are.
     fn set_all_enabled(&mut self, on: bool) {
         match self.tab {
             Tab::Mods => {
-                if self.mods.mods.iter().any(|m| m.enabled != on) {
-                    self.mods.mods.iter_mut().for_each(|m| m.enabled = on);
+                let q = &self.mod_search;
+                let mut hit = self.mods.mods.iter_mut().filter(|m| matches_search(&m.name, q) && m.enabled != on).peekable();
+                if hit.peek().is_some() {
+                    hit.for_each(|m| m.enabled = on);
                     self.mods_changed();
                 }
             }
             Tab::Plugins => {
                 if let Some(lo) = &mut self.load_order {
-                    lo.plugins.iter_mut().filter(|p| !p.locked).for_each(|p| p.enabled = on);
+                    let q = &self.plugin_search;
+                    lo.plugins.iter_mut().filter(|p| !p.locked && matches_search(&p.name, q)).for_each(|p| p.enabled = on);
                 }
                 self.save_load_order();
             }
@@ -794,14 +838,20 @@ impl App {
         // Locked plugins are always sorted first, so the two groups are contiguous.
         let split = lo.plugins.iter().take_while(|p| p.locked).count();
         let n = lo.plugins.len();
+        let q = &self.plugin_search;
+        let filtering = !q.trim().is_empty();
+        let pick = |r: std::ops::Range<usize>| -> Vec<usize> { r.filter(|&i| matches_search(&lo.plugins[i].name, q)).collect() };
+        let groups = [("plugins_base", "Base game & DLC", pick(0..split), false), ("plugins_mods", "Mods", pick(split..n), true)];
         egui::ScrollArea::vertical().id_salt("plugins_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            for (salt, title, range, open) in [("plugins_base", "Base game & DLC", 0..split, false), ("plugins_mods", "Mods", split..n, true)] {
-                let active = lo.plugins[range.clone()].iter().filter(|p| p.enabled).count();
-                let header = format!("{title}  ({active}/{})", range.len());
+            for (salt, title, rows, open) in groups {
+                let active = rows.iter().filter(|&&i| lo.plugins[i].enabled).count();
+                let header = format!("{title}  ({active}/{})", rows.len());
+                // While searching, groups with matches open by themselves so results are never hidden.
                 egui::CollapsingHeader::new(RichText::new(header).strong().color(theme::TEXT))
                     .id_salt(salt)
                     .default_open(open)
-                    .show_unindented(ui, |ui| plugin_table(ui, lo, salt, range, &mut changed, &mut mv));
+                    .open(filtering.then_some(!rows.is_empty()))
+                    .show_unindented(ui, |ui| plugin_table(ui, lo, salt, &rows, filtering, &mut changed, &mut mv));
             }
         });
         if let Some((i, up)) = mv {
@@ -1187,10 +1237,17 @@ fn rand_suffix() -> String {
     format!("{:x}", h.finish() & 0xffff_ffff)
 }
 
-/// One plugin group (`range` of the load order) as a table without its own scroll area.
-fn plugin_table(ui: &mut egui::Ui, lo: &mut LoadOrder, salt: &str, range: std::ops::Range<usize>, changed: &mut bool, mv: &mut Option<(usize, bool)>) {
-    if range.is_empty() {
-        ui.label(RichText::new("No plugins.").color(theme::TEXT_WEAK));
+/// Case-insensitive substring match of a list entry against the search text (an empty search matches everything).
+fn matches_search(name: &str, query: &str) -> bool {
+    let q = query.trim();
+    q.is_empty() || name.to_lowercase().contains(&q.to_lowercase())
+}
+
+/// One plugin group (`rows`: indices into the load order) as a table without its own scroll area.
+/// Reordering is off while `filtering`, since a move would swap with a hidden neighbour.
+fn plugin_table(ui: &mut egui::Ui, lo: &mut LoadOrder, salt: &str, rows: &[usize], filtering: bool, changed: &mut bool, mv: &mut Option<(usize, bool)>) {
+    if rows.is_empty() {
+        ui.label(RichText::new(if filtering { "No matching plugins." } else { "No plugins." }).color(theme::TEXT_WEAK));
         return;
     }
     egui_extras::TableBuilder::new(ui)
@@ -1204,9 +1261,9 @@ fn plugin_table(ui: &mut egui::Ui, lo: &mut LoadOrder, salt: &str, range: std::o
         .column(Column::exact(160.0))
         .column(Column::exact(52.0))
         .body(|body| {
-            body.rows(ROW_H, range.len(), |mut row| {
-                let i = range.start + row.index();
-                let (up, down) = (lo.can_move(i, true), lo.can_move(i, false));
+            body.rows(ROW_H, rows.len(), |mut row| {
+                let i = rows[row.index()];
+                let (up, down) = (!filtering && lo.can_move(i, true), !filtering && lo.can_move(i, false));
                 let p = &mut lo.plugins[i];
                 row.col(|ui| {
                     ui.add_enabled_ui(!p.locked, |ui| {
@@ -1250,10 +1307,11 @@ fn plugin_table(ui: &mut egui::Ui, lo: &mut LoadOrder, salt: &str, range: std::o
                         return;
                     }
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if ui.add_enabled(up, theme::icon_button("⏶")).clicked() {
+                    let hint = if filtering { "Clear the search to reorder" } else { "" };
+                    if ui.add_enabled(up, theme::icon_button("⏶")).on_disabled_hover_text(hint).clicked() {
                         *mv = Some((i, true));
                     }
-                    if ui.add_enabled(down, theme::icon_button("⏷")).clicked() {
+                    if ui.add_enabled(down, theme::icon_button("⏷")).on_disabled_hover_text(hint).clicked() {
                         *mv = Some((i, false));
                     }
                 });

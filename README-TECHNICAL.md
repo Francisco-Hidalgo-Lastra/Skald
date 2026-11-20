@@ -386,7 +386,13 @@ gets a red slash, so the icon shows up once the mod is deployed.
   main area with a **Mods** / **Plugins** tab strip (`Tab` in `app.rs`; each tab shows its active count, and
   the open list's summary sits on the right of the strip, next to **Enable all** / **Disable all**:
   `set_all_enabled` acts on the open tab; for mods it goes through `mods_changed` (so the state becomes
-  "Changes not deployed") and is disabled while a job runs; for plugins it skips locked base-game plugins and saves `Plugins.txt` straight away). The Plugins tab
+  "Changes not deployed") and is disabled while a job runs; for plugins it skips locked base-game plugins and saves `Plugins.txt` straight away). A search box after the tabs filters the open list
+  (`mod_search` / `plugin_search`, one per tab, not saved; `matches_search` is a trimmed, case-insensitive
+  substring match; Ctrl+F focuses it, Esc clears it). The lists then render only the matching indices into the
+  real list, so checkboxes, selection and the context menu still act on the right entry. While a search is
+  active, `set_all_enabled` acts only on matches (labels change to Enable/Disable matches), reordering is
+  disabled (a move would swap with a hidden neighbour), and plugin groups are forced open if they have
+  matches and closed if not. The Plugins tab
   shows two `CollapsingHeader` groups in one scroll area: the locked plugins (always a prefix of the load
   order, so `0..split`) as "Base game & DLC", closed by default, and the rest as "Mods". Each group is its
   own `plugin_table` (no inner scroll) indexing into the shared `LoadOrder`, and the header shows active/total. At the bottom the selected mod's details plus a log (errors in red).

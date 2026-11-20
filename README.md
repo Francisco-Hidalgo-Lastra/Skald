@@ -98,6 +98,11 @@ to deploy again.
 The main area has two tabs at the top: **Mods** and **Plugins**. Click one to switch lists.
 **Enable all** and **Disable all**, on the right of the tabs, switch every entry in the open list on or off.
 
+The **search box** next to the tabs shows only the mods or plugins whose name contains what you type
+(upper or lower case doesn't matter). Press **Ctrl+F** to jump to it, and **Esc** or **✖** to clear it.
+Each tab keeps its own search. While searching, the buttons become **Enable matches** / **Disable matches**
+and only affect what's shown, and **⏶ ⏷** are greyed out: clear the search to reorder.
+
 ### Mods tab
 - **Checkbox**: tick to use the mod, untick to switch it off without deleting it.
 - **⏶ ⏷**: move the mod up or down. **When two mods change the same file, the one lower in the
