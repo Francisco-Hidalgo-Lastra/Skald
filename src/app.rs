@@ -586,10 +586,16 @@ impl App {
             return;
         }
         let (mods, conflicts, selected) = (&mut self.mods.mods, &self.conflicts, &mut self.selected);
+        // Drag-to-reorder: the dragged row index lives in egui memory; the drop slot is found while drawing rows.
+        let ctx = ui.ctx().clone();
+        let drag_id = ui.scope_id().with("mods_drag_from");
+        let can_drag = !busy && !filtering;
+        let mut drop_to: Option<usize> = None;
+        let painter = ui.painter().clone();
         egui_extras::TableBuilder::new(ui)
             .id_salt("mods")
             .striped(true)
-            .sense(egui::Sense::click())
+            .sense(egui::Sense::click_and_drag())
             .auto_shrink([false, false])
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
@@ -660,6 +666,18 @@ impl App {
                         });
                     });
                     let r = row.response();
+                    if can_drag && r.drag_started_by(egui::PointerButton::Primary) {
+                        ctx.data_mut(|d| d.insert_temp(drag_id, i));
+                        *selected = Some(i);
+                    }
+                    if let Some(from) = ctx.data(|d| d.get_temp::<usize>(drag_id))
+                        && let Some(pos) = ctx.pointer_interact_pos()
+                        && r.rect.y_range().contains(pos.y)
+                    {
+                        drop_to = Some(i);
+                        let y = if i >= from { r.rect.bottom() } else { r.rect.top() };
+                        painter.hline(r.rect.x_range(), y, egui::Stroke::new(2.0, theme::FROST));
+                    }
                     if r.clicked() || r.secondary_clicked() {
                         *selected = Some(i);
                     }
@@ -680,6 +698,21 @@ impl App {
                     });
                 });
             });
+        if let Some(from) = ctx.data(|d| d.get_temp::<usize>(drag_id)) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if ctx.input(|i| i.pointer.any_released()) {
+                ctx.data_mut(|d| d.remove::<usize>(drag_id));
+                if let Some(to) = drop_to
+                    && to != from
+                    && to < self.mods.mods.len()
+                {
+                    let m = self.mods.mods.remove(from);
+                    self.mods.mods.insert(to, m);
+                    self.selected = Some(to);
+                    changed = true;
+                }
+            }
+        }
         match action {
             Some((i, "up")) => {
                 self.mods.mods.swap(i, i - 1);

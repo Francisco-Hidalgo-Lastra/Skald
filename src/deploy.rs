@@ -26,6 +26,24 @@ pub struct DeployedFile {
     pub target: PathBuf,
     pub source: PathBuf,
     pub backup: Option<PathBuf>,
+    /// What the placed file looked like right after deploying, so it can be
+    /// recognised even after its source (staging folder) is gone.
+    #[serde(default)]
+    pub stamp: Option<Stamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime: i64,
+}
+
+impl Stamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self { dev: meta.dev(), ino: meta.ino(), len: meta.len(), mtime: meta.mtime() }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +95,12 @@ impl Deployer {
         if meta.file_type().is_symlink() {
             return fs::read_link(&f.target).map(|l| l == f.source).unwrap_or(false);
         }
+        if let Some(st) = f.stamp {
+            let now = Stamp::of(&meta);
+            // Hardlinks share mtime with the source, so only the identity counts.
+            return if method == Some(DeployMethod::Copy) { now == st } else { now.dev == st.dev && now.ino == st.ino };
+        }
+        // Manifests written before stamps existed: compare with the source.
         match fs::metadata(&f.source) {
             Ok(src) if src.ino() == meta.ino() && src.dev() == meta.dev() => true,
             Ok(src) => method == Some(DeployMethod::Copy) && src.len() == meta.len(),
@@ -155,8 +179,12 @@ impl Deployer {
                     report.backed_up += 1;
                 }
                 // Record before linking so a crash can still be purged.
-                manifest.files.push(DeployedFile { target: target.clone(), source: src.clone(), backup });
+                manifest.files.push(DeployedFile { target: target.clone(), source: src.clone(), backup, stamp: None });
                 link(src, &target, method).with_context(|| format!("deploying {}", target.display()))?;
+                manifest.files.last_mut().unwrap().stamp = fs::symlink_metadata(&target)
+                    .ok()
+                    .filter(|m| !m.file_type().is_symlink())
+                    .map(|m| Stamp::of(&m));
                 report.deployed += 1;
             }
             Ok(())
@@ -216,6 +244,33 @@ mod tests {
             assert_eq!(fs::read_to_string(data.join("Textures/vanilla.dds")).unwrap(), "vanilla");
             assert!(!data.join("Textures/A.dds").exists());
             assert!(!game.join("loader.dll").exists());
+        }
+    }
+
+    #[test]
+    fn purge_after_mod_folder_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().join("skald");
+        let game = t.path().join("game");
+        let data = game.join("Data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("shared.esp"), b"vanilla").unwrap();
+
+        let dep = Deployer::new(&base);
+        for method in [DeployMethod::Hardlink, DeployMethod::Symlink, DeployMethod::Copy] {
+            let mut list = ModList::load(&base).unwrap();
+            let d = base.join("mods/A/data/meshes");
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("a.nif"), b"a").unwrap();
+            fs::write(base.join("mods/A/data/shared.esp"), b"mod").unwrap();
+            list.mods.push(entry("A"));
+
+            dep.deploy(&list, &game, &data, method).unwrap();
+            list.remove(0).unwrap(); // staging folder deleted while deployed
+            let r = dep.purge().unwrap();
+            assert!(r.warnings.is_empty(), "{method:?}: {:?}", r.warnings);
+            assert!(!data.join("meshes").exists(), "{method:?}");
+            assert_eq!(fs::read_to_string(data.join("shared.esp")).unwrap(), "vanilla");
         }
     }
 }
