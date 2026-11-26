@@ -200,14 +200,24 @@ pub fn move_out(data_dir: &Path, names: &[String], dest_root: &Path) -> Result<(
     }
     fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut moved = vec![];
-    for name in names {
-        let Some(src) = find_child_ci(data_dir, name) else { continue };
-        let real = src.file_name().map(|f| f.to_os_string()).unwrap_or_else(|| name.into());
+    // Linux is case-sensitive, so Data can hold several spellings of one plugin; the load
+    // order shows them as one entry, so move them all or the plugin seems to stay.
+    let entries: Vec<PathBuf> = fs::read_dir(data_dir)
+        .with_context(|| format!("reading {}", data_dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    let targets = entries.iter().filter(|p| {
+        let n = p.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+        names.iter().any(|w| w.to_lowercase() == n)
+    });
+    for src in targets {
+        let real = src.file_name().unwrap().to_os_string();
         let to = dest.join(&real);
-        if fs::rename(&src, &to).is_err() {
+        if fs::rename(src, &to).is_err() {
             // Different filesystem: copy, then remove the original only once the copy exists.
-            fs::copy(&src, &to).with_context(|| format!("copying {}", src.display()))?;
-            fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
+            fs::copy(src, &to).with_context(|| format!("copying {}", src.display()))?;
+            fs::remove_file(src).with_context(|| format!("removing {}", src.display()))?;
         }
         moved.push(real.to_string_lossy().into_owned());
     }
@@ -223,18 +233,21 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let (data, appdata, game, stash) = (t.path().join("Data"), t.path().join("app"), t.path().to_path_buf(), t.path().join("unmanaged"));
         fs::create_dir_all(&data).unwrap();
-        for n in ["Skyrim.esm", "Mine.esp", "Old.esp"] {
+        for n in ["Skyrim.esm", "Mine.esp", "Old.esp", "old.esp"] {
             fs::write(data.join(n), b"").unwrap();
         }
         let mut lo = LoadOrder::load(&appdata, &data, &game, &[]);
         lo.mark_unmanaged(&HashSet::from(["mine.esp".to_string()]));
         let un: Vec<_> = lo.plugins.iter().filter(|p| p.unmanaged).map(|p| p.name.clone()).collect();
-        assert_eq!(un, ["Old.esp"]);
+        assert_eq!(un.len(), 1);
+        assert!(un[0].eq_ignore_ascii_case("old.esp"));
 
-        let (dest, moved) = move_out(&data, &["old.ESP".to_string()], &stash).unwrap();
-        assert_eq!(moved, ["Old.esp"]);
-        assert!(dest.join("Old.esp").exists());
-        assert!(!data.join("Old.esp").exists());
+        // Both spellings go, even though the load order lists only one.
+        let (dest, mut moved) = move_out(&data, &["old.ESP".to_string()], &stash).unwrap();
+        moved.sort();
+        assert_eq!(moved, ["Old.esp", "old.esp"]);
+        assert!(dest.join("Old.esp").exists() && dest.join("old.esp").exists());
+        assert!(!data.join("Old.esp").exists() && !data.join("old.esp").exists());
         assert!(data.join("Mine.esp").exists());
     }
 

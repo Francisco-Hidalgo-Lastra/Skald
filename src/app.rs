@@ -15,6 +15,57 @@ use std::sync::mpsc::{Receiver, channel};
 const BAR_H: f32 = 40.0;
 const ROW_H: f32 = 28.0;
 
+/// Selected mods (indices into the mod list). `anchor` is the last plain or
+/// ctrl click: the details panel shows it and shift-clicks select from it.
+#[derive(Default)]
+struct Selection {
+    set: std::collections::BTreeSet<usize>,
+    anchor: Option<usize>,
+}
+
+impl Selection {
+    fn only(&mut self, i: usize) {
+        self.set = [i].into();
+        self.anchor = Some(i);
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn contains(&self, i: usize) -> bool {
+        self.set.contains(&i)
+    }
+
+    /// The mod the details panel shows.
+    fn primary(&self) -> Option<usize> {
+        self.anchor.filter(|a| self.set.contains(a)).or_else(|| self.set.first().copied())
+    }
+
+    /// A click on row `i`; `order` is every row in on-screen order, for shift ranges.
+    fn click(&mut self, i: usize, order: &[usize], ctrl: bool, shift: bool) {
+        let range = self.anchor.and_then(|a| {
+            let (from, to) = (order.iter().position(|&x| x == a)?, order.iter().position(|&x| x == i)?);
+            Some(&order[from.min(to)..=from.max(to)])
+        });
+        match (shift, range) {
+            (true, Some(range)) => {
+                if !ctrl {
+                    self.set.clear();
+                }
+                self.set.extend(range);
+            }
+            _ if ctrl => {
+                if !self.set.remove(&i) {
+                    self.set.insert(i);
+                }
+                self.anchor = Some(i);
+            }
+            _ => self.only(i),
+        }
+    }
+}
+
 enum JobResult {
     Extracted { archive: PathBuf, temp: PathBuf, extracted: PathBuf, kind: InstallerKind },
     Installed { entry: ModEntry, replace_at: Option<usize>, files: usize, temp: PathBuf },
@@ -53,7 +104,7 @@ pub struct App {
     mods: ModList,
     deployer: Deployer,
     load_order: Option<LoadOrder>,
-    selected: Option<usize>,
+    selection: Selection,
     conflicts: std::collections::HashMap<String, (usize, usize)>,
     job: Option<Job>,
     install: Option<Session>,
@@ -64,6 +115,7 @@ pub struct App {
     rename: Option<(usize, String)>,
     confirm_remove: Option<usize>,
     confirm_unmanaged: bool,
+    group_dialog: Option<GroupDialog>,
     tab: Tab,
     /// Search text for the mod and plugin lists, kept separately per tab.
     mod_search: String,
@@ -90,7 +142,7 @@ impl App {
             base,
             mods,
             load_order: None,
-            selected: None,
+            selection: Selection::default(),
             conflicts: Default::default(),
             job: None,
             install: None,
@@ -102,6 +154,7 @@ impl App {
             rename: None,
             confirm_remove: None,
             confirm_unmanaged: false,
+            group_dialog: None,
             tab: Tab::default(),
             mod_search: String::new(),
             plugin_search: String::new(),
@@ -244,6 +297,7 @@ impl App {
                         author: req.author,
                         source: Some(req.source.display().to_string()),
                         installed_at: mods::now(),
+                        group: None,
                     },
                     replace_at,
                     files,
@@ -320,13 +374,13 @@ impl App {
                 self.info(format!("Installed {} ({files} files)", entry.name));
                 match replace_at {
                     Some(i) => {
-                        let enabled = self.mods.mods[i].enabled;
-                        self.mods.mods[i] = ModEntry { enabled, ..entry };
-                        self.selected = Some(i);
+                        let (enabled, group) = (self.mods.mods[i].enabled, self.mods.mods[i].group.take());
+                        self.mods.mods[i] = ModEntry { enabled, group, ..entry };
+                        self.selection.only(i);
                     }
                     None => {
                         self.mods.mods.push(entry);
-                        self.selected = Some(self.mods.mods.len() - 1);
+                        self.selection.only(self.mods.mods.len() - 1);
                     }
                 }
                 self.mods_changed();
@@ -576,163 +630,166 @@ impl App {
             return;
         }
         let busy = self.job.is_some();
-        let mut changed = false;
-        let mut action: Option<(usize, &'static str)> = None;
-        let n = self.mods.mods.len();
         let filtering = !self.mod_search.trim().is_empty();
-        let shown: Vec<usize> = (0..n).filter(|&i| matches_search(&self.mods.mods[i].name, &self.mod_search)).collect();
-        if shown.is_empty() {
+        let q = &self.mod_search;
+        // One section per user group in their order, then the ungrouped mods.
+        let sections: Vec<(Option<String>, Vec<usize>)> = self
+            .mods
+            .groups
+            .iter()
+            .map(|g| Some(g.clone()))
+            .chain([None])
+            .map(|g| {
+                let rows = self.mods.in_group(g.as_deref()).into_iter().filter(|&i| matches_search(&self.mods.mods[i].name, q)).collect();
+                (g, rows)
+            })
+            .collect();
+        if sections.iter().all(|(_, rows)| rows.is_empty()) {
             empty_state(ui, "🔍", "No matching mods", "Nothing in the mod list matches the search.");
             return;
         }
-        let (mods, conflicts, selected) = (&mut self.mods.mods, &self.conflicts, &mut self.selected);
         // Drag-to-reorder: the dragged row index lives in egui memory; the drop slot is found while drawing rows.
         let ctx = ui.ctx().clone();
-        let drag_id = ui.scope_id().with("mods_drag_from");
-        let can_drag = !busy && !filtering;
-        let mut drop_to: Option<usize> = None;
-        let painter = ui.painter().clone();
-        egui_extras::TableBuilder::new(ui)
-            .id_salt("mods")
-            .striped(true)
-            .sense(egui::Sense::click_and_drag())
-            .auto_shrink([false, false])
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(26.0))
-            .column(Column::exact(30.0))
-            .column(Column::remainder().at_least(180.0).clip(true))
-            .column(Column::initial(110.0).at_least(70.0).resizable(true))
-            .column(Column::initial(90.0).at_least(50.0).resizable(true))
-            .column(Column::initial(90.0).at_least(70.0))
-            .column(Column::exact(52.0))
-            .header(26.0, |mut h| {
-                for t in ["", "#", "NAME", "INSTALLER", "VERSION", "CONFLICTS", ""] {
-                    h.col(|ui| {
-                        ui.label(RichText::new(t).small().strong().color(theme::TEXT_WEAK));
+        let mut t = ModTable {
+            mods: &mut self.mods.mods,
+            groups: &self.mods.groups,
+            conflicts: &self.conflicts,
+            selection: &mut self.selection,
+            order: sections.iter().flat_map(|(_, rows)| rows.iter().copied()).collect(),
+            busy,
+            filtering,
+            drag_id: egui::Id::unique("mods_drag_from"),
+            painter: ui.painter().clone(),
+            drop_to: None,
+            changed: false,
+            action: None,
+        };
+        if t.groups.is_empty() {
+            let rows = sections.into_iter().next_back().map(|(_, r)| r).unwrap_or_default();
+            mod_table(ui, &mut t, "mods", &rows, None, true);
+        } else {
+            let n_groups = t.groups.len();
+            egui::ScrollArea::vertical().id_salt("mods_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                for (gi, (group, rows)) in sections.iter().enumerate() {
+                    let total = t.mods.iter().filter(|m| m.group == *group).count();
+                    if group.is_none() && total == 0 {
+                        continue;
+                    }
+                    let active = rows.iter().filter(|&&i| t.mods[i].enabled).count();
+                    let title = group.as_deref().unwrap_or("Ungrouped");
+                    let header = format!("{title}  ({active}/{})", rows.len());
+                    let salt = format!("mod_group:{}", group.as_deref().unwrap_or("\0ungrouped"));
+                    // While searching, groups with matches open by themselves so results are never hidden.
+                    let r = egui::CollapsingHeader::new(RichText::new(header).strong().color(theme::TEXT))
+                        .id_salt(&salt)
+                        .default_open(true)
+                        .open(filtering.then_some(!rows.is_empty()))
+                        .show_unindented(ui, |ui| mod_table(ui, &mut t, &salt, rows, group.as_deref(), false));
+                    r.header_response.context_menu(|ui| {
+                        let mut act = None;
+                        if let Some(g) = group {
+                            if ui.button("✏  Rename group…").clicked() {
+                                act = Some(ModAction::RenameGroup(g.clone()));
+                            }
+                            if ui.add_enabled(gi > 0, egui::Button::new("⏶  Move group up")).clicked() {
+                                act = Some(ModAction::MoveGroup(gi, true));
+                            }
+                            if ui.add_enabled(gi + 1 < n_groups, egui::Button::new("⏷  Move group down")).clicked() {
+                                act = Some(ModAction::MoveGroup(gi, false));
+                            }
+                            ui.separator();
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Enable all in group")).clicked() {
+                            act = Some(ModAction::EnableGroup(group.clone(), true));
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Disable all in group")).clicked() {
+                            act = Some(ModAction::EnableGroup(group.clone(), false));
+                        }
+                        if let Some(g) = group {
+                            ui.separator();
+                            if ui.button(RichText::new("🗑  Delete group").color(theme::RED)).on_hover_text("Its mods move to Ungrouped; nothing is uninstalled").clicked() {
+                                act = Some(ModAction::DeleteGroup(g.clone()));
+                            }
+                        }
+                        if act.is_some() {
+                            t.action = act;
+                            ui.close();
+                        }
                     });
                 }
-            })
-            .body(|body| {
-                body.rows(ROW_H, shown.len(), |mut row| {
-                    let i = shown[row.index()];
-                    let m = &mut mods[i];
-                    row.set_selected(*selected == Some(i));
-                    row.col(|ui| {
-                        ui.add_enabled_ui(!busy, |ui| {
-                            if ui.checkbox(&mut m.enabled, "").changed() {
-                                changed = true;
-                            }
-                        });
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(format!("{i}")).monospace().color(theme::TEXT_WEAK));
-                    });
-                    row.col(|ui| {
-                        let t = RichText::new(&m.name);
-                        ui.add(egui::Label::new(if m.enabled { t.color(theme::TEXT) } else { t.color(theme::TEXT_WEAK) }).selectable(false).truncate());
-                    });
-                    row.col(|ui| {
-                        if !m.installer.is_empty() {
-                            theme::pill(ui, m.installer.to_uppercase(), installer_color(&m.installer));
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(m.version.as_deref().unwrap_or("")).color(theme::TEXT_WEAK));
-                    });
-                    row.col(|ui| {
-                        if let Some((over, under)) = conflicts.get(&m.name) {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            if *over > 0 {
-                                ui.label(RichText::new(format!("▲{over}")).color(theme::GREEN))
-                                    .on_hover_text(format!("Overrides {over} files from mods above"));
-                            }
-                            if *under > 0 {
-                                ui.label(RichText::new(format!("▼{under}")).color(theme::RED))
-                                    .on_hover_text(format!("{under} files overridden by mods below"));
-                            }
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        // Moving while filtered would swap with hidden neighbours, so it waits for a clear search.
-                        let hint = if filtering { "Clear the search to reorder" } else { "" };
-                        ui.add_enabled_ui(!busy && !filtering, |ui| {
-                            if ui.add_enabled(i > 0, theme::icon_button("⏶")).on_hover_text("Move up").on_disabled_hover_text(hint).clicked() {
-                                action = Some((i, "up"));
-                            }
-                            if ui.add_enabled(i + 1 < n, theme::icon_button("⏷")).on_hover_text("Move down").on_disabled_hover_text(hint).clicked() {
-                                action = Some((i, "down"));
-                            }
-                        });
-                    });
-                    let r = row.response();
-                    if can_drag && r.drag_started_by(egui::PointerButton::Primary) {
-                        ctx.data_mut(|d| d.insert_temp(drag_id, i));
-                        *selected = Some(i);
-                    }
-                    if let Some(from) = ctx.data(|d| d.get_temp::<usize>(drag_id))
-                        && let Some(pos) = ctx.pointer_interact_pos()
-                        && r.rect.y_range().contains(pos.y)
-                    {
-                        drop_to = Some(i);
-                        let y = if i >= from { r.rect.bottom() } else { r.rect.top() };
-                        painter.hline(r.rect.x_range(), y, egui::Stroke::new(2.0, theme::FROST));
-                    }
-                    if r.clicked() || r.secondary_clicked() {
-                        *selected = Some(i);
-                    }
-                    r.context_menu(|ui| {
-                        if ui.button("✏  Rename…").clicked() {
-                            action = Some((i, "rename"));
-                            ui.close();
-                        }
-                        if ui.button("📂  Open folder").clicked() {
-                            action = Some((i, "open"));
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui.button(RichText::new("🗑  Remove").color(theme::RED)).clicked() {
-                            action = Some((i, "remove"));
-                            ui.close();
-                        }
-                    });
-                });
             });
-        if let Some(from) = ctx.data(|d| d.get_temp::<usize>(drag_id)) {
+        }
+        let (drop_to, mut changed, action) = (t.drop_to, t.changed, t.action);
+        let mut regroup = false;
+        if let Some(from) = ctx.data(|d| d.get_temp::<usize>(egui::Id::unique("mods_drag_from"))) {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             if ctx.input(|i| i.pointer.any_released()) {
-                ctx.data_mut(|d| d.remove::<usize>(drag_id));
-                if let Some(to) = drop_to
-                    && to != from
+                ctx.data_mut(|d| d.remove::<usize>(egui::Id::unique("mods_drag_from")));
+                if let Some((to, group)) = drop_to
                     && to < self.mods.mods.len()
                 {
-                    let m = self.mods.mods.remove(from);
-                    self.mods.mods.insert(to, m);
-                    self.selected = Some(to);
-                    changed = true;
+                    // Dropping into another group's section also moves the mod into that group.
+                    if self.mods.mods[from].group != group {
+                        self.mods.mods[from].group = group;
+                        regroup = true;
+                    }
+                    if to != from {
+                        let m = self.mods.mods.remove(from);
+                        self.mods.mods.insert(to, m);
+                        self.selection.only(to);
+                        changed = true;
+                    }
                 }
             }
         }
         match action {
-            Some((i, "up")) => {
-                self.mods.mods.swap(i, i - 1);
-                self.selected = Some(i - 1);
+            Some(ModAction::Swap(i, j)) => {
+                self.mods.mods.swap(i, j);
+                self.selection.only(j);
                 changed = true;
             }
-            Some((i, "down")) => {
-                self.mods.mods.swap(i, i + 1);
-                self.selected = Some(i + 1);
-                changed = true;
-            }
-            Some((i, "rename")) => self.rename = Some((i, self.mods.mods[i].name.clone())),
-            Some((i, "open")) => {
+            Some(ModAction::Rename(i)) => self.rename = Some((i, self.mods.mods[i].name.clone())),
+            Some(ModAction::Open(i)) => {
                 let _ = std::process::Command::new("xdg-open").arg(self.mods.mod_dir(&self.mods.mods[i].name)).spawn();
             }
-            Some((i, "remove")) => self.confirm_remove = Some(i),
-            _ => {}
+            Some(ModAction::Remove(i)) => self.confirm_remove = Some(i),
+            Some(ModAction::SetGroup(targets, g)) => {
+                for i in targets {
+                    self.mods.mods[i].group = g.clone();
+                }
+                regroup = true;
+            }
+            Some(ModAction::NewGroup(assign)) => self.group_dialog = Some(GroupDialog { name: String::new(), renaming: None, assign }),
+            Some(ModAction::RenameGroup(g)) => self.group_dialog = Some(GroupDialog { name: g.clone(), renaming: Some(g), assign: vec![] }),
+            Some(ModAction::DeleteGroup(g)) => {
+                self.mods.remove_group(&g);
+                self.info(format!("Deleted group {g}"));
+                regroup = true;
+            }
+            Some(ModAction::MoveGroup(gi, up)) => {
+                self.mods.groups.swap(gi, if up { gi - 1 } else { gi + 1 });
+                regroup = true;
+            }
+            Some(ModAction::EnableGroup(g, on)) => {
+                let q = &self.mod_search;
+                for m in self.mods.mods.iter_mut().filter(|m| m.group == g && matches_search(&m.name, q)) {
+                    changed |= m.enabled != on;
+                    m.enabled = on;
+                }
+            }
+            None => {}
         }
         if changed {
             self.mods_changed();
+        } else if regroup {
+            self.save_mods();
+        }
+    }
+
+    /// Saves the mod list after a change that doesn't affect what gets deployed (e.g. groups).
+    fn save_mods(&mut self) {
+        if let Err(e) = self.mods.save() {
+            self.error(format!("Saving mod list failed: {e:#}"));
         }
     }
 
@@ -784,6 +841,11 @@ impl App {
                 if let Some(on) = set_all {
                     self.set_all_enabled(on);
                 }
+                if self.tab == Tab::Mods
+                    && ui.add_enabled(!self.mods.mods.is_empty(), egui::Button::new(RichText::new("New group").small())).on_hover_text("Make a group to sort mods into (right-click a mod to assign it)").clicked()
+                {
+                    self.group_dialog = Some(GroupDialog { name: String::new(), renaming: None, assign: vec![] });
+                }
                 if self.tab == Tab::Plugins {
                     let unmanaged = self.unmanaged_plugins().len();
                     if ui
@@ -803,7 +865,8 @@ impl App {
                 }
                 ui.add_space(8.0);
                 let summary = match self.tab {
-                    Tab::Mods => format!("{enabled} of {} enabled  ·  lower in the list wins conflicts", self.mods.mods.len()),
+                    Tab::Mods if self.mods.groups.is_empty() => format!("{enabled} of {} enabled  ·  lower in the list wins conflicts", self.mods.mods.len()),
+                    Tab::Mods => format!("{enabled} of {} enabled  ·  higher # wins conflicts", self.mods.mods.len()),
                     Tab::Plugins if self.load_order.is_some() => format!("{active} active  ·  {} full, {light} light", active - light),
                     Tab::Plugins => String::new(),
                 };
@@ -897,7 +960,7 @@ impl App {
     }
 
     fn details(&mut self, ui: &mut egui::Ui) {
-        let Some(m) = self.selected.and_then(|i| self.mods.mods.get(i)) else {
+        let Some(m) = self.selection.primary().and_then(|i| self.mods.mods.get(i)) else {
             ui.label(RichText::new("Select a mod to see its details.").color(theme::TEXT_WEAK));
             return;
         };
@@ -912,6 +975,9 @@ impl App {
             theme::pill(ui, m.installer.to_uppercase(), installer_color(&m.installer));
             if !m.enabled {
                 theme::pill(ui, "DISABLED", theme::TEXT_WEAK);
+            }
+            if let Some(g) = &m.group {
+                theme::pill(ui, g.to_uppercase(), theme::GOLD).on_hover_text("Group");
             }
         });
         if let Some(s) = &m.source {
@@ -1010,7 +1076,7 @@ impl App {
                         match self.mods.remove(i) {
                             Ok(()) => {
                                 self.info(format!("Removed {name}"));
-                                self.selected = None;
+                                self.selection.clear();
                                 self.mods_changed();
                             }
                             Err(e) => self.error(format!("Remove failed: {e:#}")),
@@ -1021,6 +1087,53 @@ impl App {
             });
             if close {
                 self.confirm_remove = None;
+            }
+        }
+
+        if let Some(d) = &mut self.group_dialog {
+            let (mut close, mut apply) = (false, false);
+            let taken = self.mods.group_index(d.name.trim()).is_some_and(|j| d.renaming.as_deref().and_then(|g| self.mods.group_index(g)) != Some(j));
+            let valid = !d.name.trim().is_empty() && !taken;
+            egui::Modal::new(egui::Id::unique("group_name")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.heading(if d.renaming.is_some() { "Rename group" } else { "New group" });
+                ui.add_space(4.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("Group name").desired_width(f32::INFINITY));
+                r.request_focus();
+                if taken {
+                    ui.colored_label(theme::YELLOW, "A group with that name already exists.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                    let label = if d.renaming.is_some() { "Rename" } else { "Create" };
+                    if ui.add_enabled(valid, theme::accent_button(label, theme::FROST)).clicked() || (valid && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        apply = true;
+                    }
+                });
+            });
+            if apply {
+                let d = self.group_dialog.take().unwrap();
+                match &d.renaming {
+                    Some(old) => {
+                        self.mods.rename_group(old, &d.name);
+                    }
+                    None => {
+                        if let Some(g) = self.mods.add_group(&d.name)
+                        {
+                            for i in d.assign {
+                                if let Some(m) = self.mods.mods.get_mut(i) {
+                                    m.group = Some(g.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                self.save_mods();
+            } else if close {
+                self.group_dialog = None;
             }
         }
 
@@ -1350,4 +1463,199 @@ fn plugin_table(ui: &mut egui::Ui, lo: &mut LoadOrder, salt: &str, rows: &[usize
                 });
             });
         });
+}
+
+/// Something picked in the mod list, applied once drawing is done.
+enum ModAction {
+    /// Swap two mods' priorities (move up/down within a section).
+    Swap(usize, usize),
+    Rename(usize),
+    Open(usize),
+    Remove(usize),
+    /// Put these mods in a group (None = ungrouped).
+    SetGroup(Vec<usize>, Option<String>),
+    /// Ask for a new group's name, then put these mods in it.
+    NewGroup(Vec<usize>),
+    RenameGroup(String),
+    DeleteGroup(String),
+    MoveGroup(usize, bool),
+    /// Enable/disable every (search-matching) mod in a group; None = the ungrouped mods.
+    EnableGroup(Option<String>, bool),
+}
+
+/// Name prompt for creating or renaming a mod group.
+struct GroupDialog {
+    name: String,
+    /// The group being renamed; None = creating a new one.
+    renaming: Option<String>,
+    /// Mods to put in the new group.
+    assign: Vec<usize>,
+}
+
+/// What the mod tables share while drawing, and what they report back.
+struct ModTable<'a> {
+    mods: &'a mut [ModEntry],
+    groups: &'a [String],
+    conflicts: &'a std::collections::HashMap<String, (usize, usize)>,
+    selection: &'a mut Selection,
+    /// Every visible mod row in on-screen order, across all sections.
+    order: Vec<usize>,
+    busy: bool,
+    filtering: bool,
+    drag_id: egui::Id,
+    painter: egui::Painter,
+    /// Row under the pointer while dragging, and the group of its section.
+    drop_to: Option<(usize, Option<String>)>,
+    changed: bool,
+    action: Option<ModAction>,
+}
+
+/// One section of the mod list (`rows`: indices into the mod list, all in `group`).
+/// With `single`, it is the whole list: it scrolls itself and has column headers.
+/// Moving up/down swaps with the neighbour in the same section.
+fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], group: Option<&str>, single: bool) {
+    if rows.is_empty() {
+        let text = if t.filtering { "No matching mods." } else { "No mods in this group. Drag mods here, or right-click a mod and pick Group." };
+        ui.label(RichText::new(text).color(theme::TEXT_WEAK));
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let can_drag = !t.busy && !t.filtering;
+    let table = egui_extras::TableBuilder::new(ui)
+        .id_salt(salt)
+        .striped(true)
+        .vscroll(single)
+        .sense(egui::Sense::click_and_drag())
+        .auto_shrink([false, !single])
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::exact(26.0))
+        .column(Column::exact(30.0))
+        .column(Column::remainder().at_least(180.0).clip(true))
+        .column(Column::initial(110.0).at_least(70.0).resizable(single))
+        .column(Column::initial(90.0).at_least(50.0).resizable(single))
+        .column(Column::initial(90.0).at_least(70.0))
+        .column(Column::exact(52.0));
+    let body = |body: egui_extras::TableBody| {
+        body.rows(ROW_H, rows.len(), |mut row| {
+            let k = row.index();
+            let i = rows[k];
+            let m = &mut t.mods[i];
+            row.set_selected(t.selection.contains(i));
+            row.col(|ui| {
+                ui.add_enabled_ui(!t.busy, |ui| {
+                    if ui.checkbox(&mut m.enabled, "").changed() {
+                        t.changed = true;
+                    }
+                });
+            });
+            row.col(|ui| {
+                ui.label(RichText::new(format!("{i}")).monospace().color(theme::TEXT_WEAK)).on_hover_text("Priority: higher numbers win file conflicts");
+            });
+            row.col(|ui| {
+                let text = RichText::new(&m.name);
+                ui.add(egui::Label::new(if m.enabled { text.color(theme::TEXT) } else { text.color(theme::TEXT_WEAK) }).selectable(false).truncate());
+            });
+            row.col(|ui| {
+                if !m.installer.is_empty() {
+                    theme::pill(ui, m.installer.to_uppercase(), installer_color(&m.installer));
+                }
+            });
+            row.col(|ui| {
+                ui.label(RichText::new(m.version.as_deref().unwrap_or("")).color(theme::TEXT_WEAK));
+            });
+            row.col(|ui| {
+                if let Some((over, under)) = t.conflicts.get(&m.name) {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if *over > 0 {
+                        ui.label(RichText::new(format!("▲{over}")).color(theme::GREEN)).on_hover_text(format!("Overrides {over} files from lower-priority mods"));
+                    }
+                    if *under > 0 {
+                        ui.label(RichText::new(format!("▼{under}")).color(theme::RED)).on_hover_text(format!("{under} files overridden by higher-priority mods"));
+                    }
+                }
+            });
+            row.col(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // Moving while filtered would swap with hidden neighbours, so it waits for a clear search.
+                let hint = if t.filtering { "Clear the search to reorder" } else { "" };
+                ui.add_enabled_ui(!t.busy && !t.filtering, |ui| {
+                    if ui.add_enabled(k > 0, theme::icon_button("⏶")).on_hover_text("Move up").on_disabled_hover_text(hint).clicked() {
+                        t.action = Some(ModAction::Swap(i, rows[k - 1]));
+                    }
+                    if ui.add_enabled(k + 1 < rows.len(), theme::icon_button("⏷")).on_hover_text("Move down").on_disabled_hover_text(hint).clicked() {
+                        t.action = Some(ModAction::Swap(i, rows[k + 1]));
+                    }
+                });
+            });
+            let r = row.response();
+            if can_drag && r.drag_started_by(egui::PointerButton::Primary) {
+                ctx.data_mut(|d| d.insert_temp(t.drag_id, i));
+                t.selection.only(i);
+            }
+            if let Some(from) = ctx.data(|d| d.get_temp::<usize>(t.drag_id))
+                && let Some(pos) = ctx.pointer_interact_pos()
+                && r.rect.y_range().contains(pos.y)
+            {
+                t.drop_to = Some((i, group.map(str::to_string)));
+                let y = if i >= from { r.rect.bottom() } else { r.rect.top() };
+                t.painter.hline(r.rect.x_range(), y, egui::Stroke::new(2.0, theme::FROST));
+            }
+            if r.clicked() {
+                let m = ctx.input(|i| i.modifiers);
+                t.selection.click(i, &t.order, m.command, m.shift);
+            } else if r.secondary_clicked() && !t.selection.contains(i) {
+                // Right-clicking inside a multi-selection keeps it.
+                t.selection.only(i);
+            }
+            let current = t.mods[i].group.clone();
+            r.context_menu(|ui| {
+                // Group actions apply to the whole selection when the clicked mod is part of it.
+                let targets: Vec<usize> = if t.selection.contains(i) { t.selection.set.iter().copied().collect() } else { vec![i] };
+                let mut act = None;
+                if ui.button("✏  Rename…").clicked() {
+                    act = Some(ModAction::Rename(i));
+                }
+                if ui.button("📂  Open folder").clicked() {
+                    act = Some(ModAction::Open(i));
+                }
+                ui.menu_button("🗂  Group", |ui| {
+                    for g in t.groups {
+                        if ui.radio(current.as_deref() == Some(g.as_str()), g).clicked() {
+                            act = Some(ModAction::SetGroup(targets.clone(), Some(g.clone())));
+                        }
+                    }
+                    if !t.groups.is_empty() {
+                        if ui.radio(current.is_none(), "No group").clicked() {
+                            act = Some(ModAction::SetGroup(targets.clone(), None));
+                        }
+                        ui.separator();
+                    }
+                    if ui.button("New group…").clicked() {
+                        act = Some(ModAction::NewGroup(targets.clone()));
+                    }
+                });
+                ui.separator();
+                if ui.button(RichText::new("🗑  Remove").color(theme::RED)).clicked() {
+                    act = Some(ModAction::Remove(i));
+                }
+                if act.is_some() {
+                    t.action = act;
+                    ui.close();
+                }
+            });
+        });
+    };
+    if single {
+        table
+            .header(26.0, |mut h| {
+                for title in ["", "#", "NAME", "INSTALLER", "VERSION", "CONFLICTS", ""] {
+                    h.col(|ui| {
+                        ui.label(RichText::new(title).small().strong().color(theme::TEXT_WEAK));
+                    });
+                }
+            })
+            .body(body);
+    } else {
+        table.body(body);
+    }
 }

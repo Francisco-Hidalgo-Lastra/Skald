@@ -113,8 +113,13 @@ impl Deployer {
         let m = self.load_manifest()?;
         let mut report = Report::default();
         for f in m.files.iter().rev() {
+            // A "backup" identical to what we deployed is a stale copy of the mod's own file
+            // (e.g. left behind by an older Skald or a reinstall), not an original: restoring it
+            // would keep the file in Data after the mod is disabled.
+            let mut stale_backup = false;
             if fs::symlink_metadata(&f.target).is_ok() {
                 if Self::is_ours(f, m.method) {
+                    stale_backup = f.backup.as_ref().is_some_and(|b| same_content(b, &f.target));
                     fs::remove_file(&f.target)
                         .with_context(|| format!("removing {}", f.target.display()))?;
                 } else {
@@ -131,7 +136,11 @@ impl Deployer {
             }
             if let Some(b) = &f.backup
                 && b.exists() {
-                    fs::rename(b, &f.target).with_context(|| format!("restoring {}", f.target.display()))?;
+                    if stale_backup {
+                        let _ = fs::remove_file(b);
+                    } else {
+                        fs::rename(b, &f.target).with_context(|| format!("restoring {}", f.target.display()))?;
+                    }
                 }
             report.deployed += 1;
         }
@@ -171,6 +180,11 @@ impl Deployer {
                 let base = if k.0 { game_dir } else { data_dir };
                 let target = resolve_ci_create(base, rel, &mut manifest.created_dirs)?;
                 let mut backup = None;
+                // An existing exact copy of the file we're about to place isn't worth keeping:
+                // backing it up would bring it back on purge, even once its mod is disabled.
+                if same_content(&target, src) {
+                    fs::remove_file(&target).with_context(|| format!("replacing {}", target.display()))?;
+                }
                 if fs::symlink_metadata(&target).is_ok() {
                     let b = self.backup_dir.join(if k.0 { "root" } else { "data" }).join(rel);
                     fs::create_dir_all(b.parent().unwrap())?;
@@ -194,6 +208,27 @@ impl Deployer {
     }
 }
 
+/// Are `a` and `b` both regular files with identical bytes?
+fn same_content(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(ma), Ok(mb)) = (fs::symlink_metadata(a), fs::symlink_metadata(b)) else { return false };
+    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = match fa.read(&mut ba) {
+            Ok(0) => return true,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
+        }
+    }
+}
+
 fn link(src: &Path, dst: &Path, method: DeployMethod) -> std::io::Result<()> {
     match method {
         DeployMethod::Hardlink => fs::hard_link(src, dst).or_else(|_| std::os::unix::fs::symlink(src, dst)),
@@ -208,7 +243,7 @@ mod tests {
     use crate::mods::ModEntry;
 
     fn entry(name: &str) -> ModEntry {
-        ModEntry { name: name.into(), enabled: true, installer: "Simple".into(), version: None, author: None, source: None, installed_at: 0 }
+        ModEntry { name: name.into(), enabled: true, installer: "Simple".into(), version: None, author: None, source: None, installed_at: 0, group: None }
     }
 
     #[test]
@@ -245,6 +280,45 @@ mod tests {
             assert!(!data.join("Textures/A.dds").exists());
             assert!(!game.join("loader.dll").exists());
         }
+    }
+
+    #[test]
+    fn stale_copies_are_not_restored() {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().join("skald");
+        let game = t.path().join("game");
+        let data = game.join("Data");
+        fs::create_dir_all(&data).unwrap();
+        let d = base.join("mods/A/data");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("A.esp"), b"mod").unwrap();
+        fs::write(d.join("B.esp"), b"mod b").unwrap();
+        // Leftover copies in Data: one identical to the mod's file, one genuinely different.
+        fs::write(data.join("A.esp"), b"mod").unwrap();
+        fs::write(data.join("B.esp"), b"original").unwrap();
+        let mut list = ModList::load(&base).unwrap(); // picks up the "A" folder
+        assert_eq!(list.mods.len(), 1);
+        list.mods[0].enabled = true;
+
+        let dep = Deployer::new(&base);
+        let r = dep.deploy(&list, &game, &data, DeployMethod::Hardlink).unwrap();
+        assert_eq!(r.backed_up, 1);
+        dep.purge().unwrap();
+        assert!(!data.join("A.esp").exists());
+        assert_eq!(fs::read_to_string(data.join("B.esp")).unwrap(), "original");
+
+        // Same, for a backup taken by an older version (identical copy already in backups).
+        let dep2 = Deployer::new(&base);
+        dep2.deploy(&list, &game, &data, DeployMethod::Hardlink).unwrap();
+        fs::create_dir_all(dep2.backup_dir.join("data")).unwrap();
+        fs::write(dep2.backup_dir.join("data/A.esp"), b"mod").unwrap();
+        let mut m = dep2.load_manifest().unwrap();
+        m.files.iter_mut().find(|f| f.target.ends_with("A.esp")).unwrap().backup = Some(dep2.backup_dir.join("data/A.esp"));
+        dep2.save_manifest(&m).unwrap();
+        list.mods[0].enabled = false;
+        dep2.deploy(&list, &game, &data, DeployMethod::Hardlink).unwrap();
+        assert!(!data.join("A.esp").exists());
+        assert_eq!(fs::read_to_string(data.join("B.esp")).unwrap(), "original");
     }
 
     #[test]

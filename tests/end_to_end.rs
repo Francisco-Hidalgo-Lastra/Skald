@@ -67,7 +67,7 @@ fn fomod_zip_install_and_deploy() {
     installer::execute(&ops, &list.mod_dir("Armor Pack")).unwrap();
     list.mods.push(ModEntry {
         name: "Armor Pack".into(), enabled: true, installer: "FOMOD".into(),
-        version: None, author: None, source: None, installed_at: 0,
+        version: None, author: None, source: None, installed_at: 0, group: None,
     });
 
     let game = t.path().join("game");
