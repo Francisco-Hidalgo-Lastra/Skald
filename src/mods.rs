@@ -164,25 +164,75 @@ impl ModList {
         (0..self.mods.len()).filter(|&i| self.mods[i].group.as_deref() == group).collect()
     }
 
-    /// For each enabled mod: (files it overrides from lower mods, files
-    /// overridden by higher mods).
-    pub fn conflicts(&self) -> HashMap<String, (usize, usize)> {
-        let mut owner: HashMap<String, usize> = HashMap::new();
-        let mut result: HashMap<String, (usize, usize)> = HashMap::new();
+    /// Bytes on disk of each mod's staging folder, keyed by mod name.
+    pub fn sizes(&self) -> HashMap<String, u64> {
+        self.mods
+            .iter()
+            .map(|m| {
+                let size = walkdir::WalkDir::new(self.mod_dir(&m.name))
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| e.file_type().is_file())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|md| md.len())
+                    .sum();
+                (m.name.clone(), size)
+            })
+            .collect()
+    }
+
+    /// File conflicts between enabled mods, keyed by mod name. Mods without conflicts are absent.
+    pub fn conflicts(&self) -> HashMap<String, Conflicts> {
+        // Every enabled mod that ships each file, in priority order.
+        let mut owners: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, m) in self.mods.iter().enumerate().filter(|(_, m)| m.enabled) {
             for sub in ["data", "root"] {
                 let dir = self.mod_dir(&m.name).join(sub);
                 for f in paths::list_files(&dir) {
-                    let k = format!("{sub}/{}", paths::key(&f));
-                    if let Some(prev) = owner.insert(k, i) {
-                        result.entry(m.name.clone()).or_default().0 += 1;
-                        result.entry(self.mods[prev].name.clone()).or_default().1 += 1;
-                    }
+                    owners.entry(format!("{sub}/{}", paths::key(&f))).or_default().push(i);
                 }
             }
         }
-        result
+        let mut pairs: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut result: HashMap<usize, Conflicts> = HashMap::new();
+        for list in owners.values().filter(|l| l.len() > 1) {
+            for (k, &lo) in list.iter().enumerate() {
+                let c = result.entry(lo).or_default();
+                if k > 0 {
+                    c.overrides += 1;
+                }
+                if k + 1 < list.len() {
+                    c.overridden += 1;
+                }
+                for &hi in &list[k + 1..] {
+                    *pairs.entry((lo, hi)).or_default() += 1;
+                }
+            }
+        }
+        for ((lo, hi), n) in pairs {
+            result.entry(hi).or_default().winning.push((self.mods[lo].name.clone(), n));
+            result.entry(lo).or_default().losing.push((self.mods[hi].name.clone(), n));
+        }
+        for c in result.values_mut() {
+            for v in [&mut c.winning, &mut c.losing] {
+                v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+        }
+        result.into_iter().map(|(i, c)| (self.mods[i].name.clone(), c)).collect()
     }
+}
+
+/// One mod's file conflicts with the other enabled mods.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Conflicts {
+    /// Files this mod overrides from lower-priority mods.
+    pub overrides: usize,
+    /// Files of this mod that higher-priority mods override.
+    pub overridden: usize,
+    /// Lower-priority mods this mod overrides, with the number of shared files, most first.
+    pub winning: Vec<(String, usize)>,
+    /// Higher-priority mods that override this mod, with the number of shared files, most first.
+    pub losing: Vec<(String, usize)>,
 }
 
 pub fn now() -> u64 {
@@ -237,5 +287,51 @@ mod tests {
         let l = ModList::load(t.path()).unwrap();
         assert_eq!(l.mods[0].group, None);
         assert_eq!(l.groups, ["Extra"]);
+    }
+
+    #[test]
+    fn sizes_sum_each_mod_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let l = ModList { mods: vec![entry("A", None), entry("B", None)], base: t.path().into(), ..Default::default() };
+        let a = t.path().join("mods/A");
+        fs::create_dir_all(a.join("data/meshes")).unwrap();
+        fs::create_dir_all(a.join("root")).unwrap();
+        fs::write(a.join("data/a.esp"), [0u8; 100]).unwrap();
+        fs::write(a.join("data/meshes/b.nif"), [0u8; 50]).unwrap();
+        fs::write(a.join("root/c.dll"), [0u8; 7]).unwrap();
+        let s = l.sizes();
+        assert_eq!(s["A"], 157);
+        assert_eq!(s["B"], 0);
+    }
+
+    #[test]
+    fn conflicts_list_the_other_mods() {
+        let t = tempfile::tempdir().unwrap();
+        let mut l = ModList { mods: vec![entry("A", None), entry("B", None), entry("C", None), entry("D", None)], base: t.path().into(), ..Default::default() };
+        let put = |m: &str, f: &str| {
+            let p = t.path().join("mods").join(m).join("data").join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "").unwrap();
+        };
+        put("A", "x.esp");
+        put("A", "y.esp");
+        put("B", "x.esp");
+        put("C", "X.ESP");
+        put("C", "y.esp");
+        put("D", "z.esp");
+        let c = l.conflicts();
+        assert!(!c.contains_key("D"));
+        assert_eq!((c["A"].overrides, c["A"].overridden), (0, 2));
+        assert_eq!(c["A"].losing, [("C".to_string(), 2), ("B".to_string(), 1)]);
+        assert_eq!((c["B"].overrides, c["B"].overridden), (1, 1));
+        assert_eq!(c["B"].winning, [("A".to_string(), 1)]);
+        assert_eq!(c["B"].losing, [("C".to_string(), 1)]);
+        assert_eq!((c["C"].overrides, c["C"].overridden), (2, 0));
+        assert_eq!(c["C"].winning, [("A".to_string(), 2), ("B".to_string(), 1)]);
+
+        l.mods[2].enabled = false;
+        let c = l.conflicts();
+        assert_eq!(c["A"].losing, [("B".to_string(), 1)]);
+        assert!(!c.contains_key("C"));
     }
 }

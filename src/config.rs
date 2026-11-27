@@ -39,6 +39,19 @@ pub struct Config {
     /// Proton folder override for non-Steam runners (None = auto).
     #[serde(default)]
     pub proton: Option<PathBuf>,
+    /// How the Mods tab lists mods.
+    #[serde(default)]
+    pub mod_view: ModView,
+}
+
+/// Layout of the Mods tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ModView {
+    /// One collapsible section per group.
+    #[default]
+    Groups,
+    /// One flat list in priority order, ignoring groups.
+    LoadOrder,
 }
 
 pub fn config_dir() -> PathBuf {

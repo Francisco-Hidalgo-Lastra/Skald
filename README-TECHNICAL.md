@@ -15,9 +15,10 @@ skald/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs          # binary entry: creates the eframe window (1280×800, drag-and-drop on)
-│   ├── app.rs           # GUI: mod list, plugin list, top bar, log, settings, background jobs
+│   ├── app.rs           # GUI: mod list, plugin list, top bar, settings, background jobs
 │   ├── install_ui.rs    # GUI: install dialog, one menu per installer type
 │   ├── theme.rs         # GUI: dark palette, egui style, small shared widgets (pills, cards)
+│   ├── toast.rs         # GUI: toast notifications in the bottom-right corner
 │   ├── lib.rs           # library crate `skald` (everything below is GUI-free)
 │   ├── archive.rs       # zip / 7z / rar / folder extraction
 │   ├── installer.rs     # installer-type detection + install plans
@@ -61,8 +62,8 @@ the same code as the GUI without needing a window. `app.rs`, `install_ui.rs` and
 
 | Path | Contents |
 |---|---|
-| `~/.config/skald/config.json` | `game_dir`, `appdata_dir`, `deploy_method`, `runner`, `runners`, `tools`, `proton` |
-| `~/.local/share/skald/modlist.json` | Ordered mod list (`name`, `enabled`, `installer`, `version`, `author`, `source`, `installed_at`) |
+| `~/.config/skald/config.json` | `game_dir`, `appdata_dir`, `deploy_method`, `runner`, `runners`, `tools`, `proton`, `mod_view` (`Groups` or `LoadOrder`) |
+| `~/.local/share/skald/modlist.json` | Ordered mod list (`name`, `enabled`, `installer`, `version`, `author`, `source`, `installed_at`, optional `group`) and `groups`, the user's groups in display order |
 | `~/.local/share/skald/mods/<name>/data/` | Files that go into `Skyrim Special Edition/Data` |
 | `~/.local/share/skald/mods/<name>/root/` | Files that go next to `SkyrimSE.exe` (SKSE, ENB, …) |
 | `~/.local/share/skald/deployment.json` | Manifest of every file Skald put in the game folder |
@@ -239,9 +240,19 @@ correctly before anything has been deployed.
 ## 7. Mod list and conflicts (`mods.rs`)
 
 - Order = priority. **Mods lower in the list overwrite mods above them.**
-- `conflicts()` walks enabled mods in order and records which mod owns each `data/…` and `root/…`
-  path (by `key`). Each mod gets a pair `(overrides, overridden)`, shown as `+N` (green) and `-N`
-  (red) in the **Conflicts** column.
+- `conflicts()` collects, for each `data/…` and `root/…` path (by `key`), every enabled mod that
+  ships it, in priority order. Each mod with a conflict gets a `Conflicts`: `overrides` (its files
+  that win over a lower mod), `overridden` (its files that a higher mod wins over), and `winning` /
+  `losing`, the other mods involved with the number of shared files, most first. A file shipped by
+  three mods counts for every pair, so the middle mod both overrides and is overridden. The
+  **Conflicts** column shows `▲N` (green) and `▼N` (red), and hovering lists `winning` and `losing`.
+  Mods with no conflicts aren't in the map.
+- **Groups** are labels for display. `ModEntry.group` names the group a mod belongs to (`None` is
+  ungrouped), and `ModList.groups` holds the group names in display order. Group names are unique,
+  compared without case. A group never changes priority: the order of `mods` alone decides who wins.
+  `rename_group` renames the mods' `group` fields too, and `remove_group` ungroups its mods without
+  uninstalling them. On load, a group named by a mod but missing from `groups` is added back, and a
+  `modlist.json` from before groups loads with every mod ungrouped.
 - Any change to the mod list (enable, reorder, install, remove) saves `modlist.json`, rebuilds the
   plugin list, and shows **Changes not deployed**. The game folder isn't touched until **Deploy**.
 
@@ -322,7 +333,7 @@ Staging folders under `mods/` are never changed by deploy or purge.
 1. `loot::update_masterlist` downloads `MASTERLIST_URL`
    (`github.com/loot/skyrimse`, branch `v0.29`) and `PRELUDE_URL` (`github.com/loot/prelude`, `v0.29`)
    into `~/.local/share/skald/loot/`. Each file goes through `.yaml.tmp` and a rename. If the download
-   fails but both cached files exist, it carries on with them and the log says so. With no cached
+   fails but both cached files exist, it carries on with them and an error toast says so. With no cached
    copy, the sort fails. The `v0.29` branch matches the libloot 0.29 metadata syntax. Change both
    together.
 2. `loot::sort` creates `Game::with_local_path(GameType::SkyrimSE, game_dir, appdata_dir)`. It doesn't
@@ -335,7 +346,7 @@ Staging folders under `mods/` are never changed by deploy or purge.
 3. Messages: general messages, then each plugin's `messages()` and the `dirty_info()` entries whose CRC
    matches the loaded plugin. All are evaluated, without user metadata, and in English through
    `select_message_content`. `loot::plain` strips the Markdown (`**`, `[text](url)` → `text (url)`).
-   The GUI logs errors in red and everything else as info. It skips messages for locked plugins,
+   The GUI lists them all in one toast, coloured by level. It skips messages for locked plugins,
    mostly "needs cleaning" notes on the base game and Creation Club, which can't be changed here.
 4. `LoadOrder::apply_order` reorders to match the result, ignoring case. Unknown names keep their
    relative order at the end. Then `sort_masters_first` (a stable sort) keeps locked plugins first and
@@ -360,13 +371,15 @@ no longer available, Steam is used.
   Skyrim). Otherwise the first installed one found in `compatibilitytools.d/` or `steamapps/common/`.
 - **Prefix**: an ancestor of `appdata_dir` named `489830` that contains `pfx/`. Otherwise it's
   searched for in the Steam libraries.
-- Skyrim needs the Steam client running. Before starting a non-Steam runner, Skald checks
-  `~/.steam/steam.pid` and logs a warning if Steam isn't running.
+- Skyrim needs the Steam client running. Before starting Steam or SKSE (`Runner::needs_steam`),
+  `launch::launch` checks `~/.steam/steam.pid`. If Steam isn't running, it starts nothing and
+  returns an error, which the GUI shows as an error toast. Skald never opens Steam itself: for the Steam runner,
+  `xdg-open steam://` would start the client.
 - Runs outside the Steam Linux Runtime container. This is fine for SKSE on most distros.
 
 **Tools tray**: `config.tools` (same `CustomRunner { name, exe }` shape) is a separate list from the
 Play runners. Each tool is run with `launch::launch` as a `Runner::Exe`, so it gets the same Proton,
-prefix and environment as above, but without the Steam-running warning (tools don't need it).
+prefix and environment as above, but without the Steam-running check (tools don't need Steam).
 The tray's file picker opens in the game's `Data` folder, where mod tools such as BodySlide end up
 after deploy. The tray stores the exe path as given and doesn't track which mod it came from.
 
@@ -395,7 +408,10 @@ gets a red slash, so the icon shows up once the mod is deployed.
   matches and closed if not. The Plugins tab
   shows two `CollapsingHeader` groups in one scroll area: the locked plugins (always a prefix of the load
   order, so `0..split`) as "Base game & DLC", closed by default, and the rest as "Mods". Each group is its
-  own `plugin_table` (no inner scroll) indexing into the shared `LoadOrder`, and the header shows active/total. At the bottom the selected mod's details plus a log (errors in red).
+  own `plugin_table` (no inner scroll) indexing into the shared `LoadOrder`, and the header shows active/total. At the bottom the selected mod's details.
+- **Toasts**: `toast.rs` stacks up to six toasts in the bottom-right corner, above the details panel.
+  A plain info toast fades after 5 seconds. Errors, warnings and toasts with a list of details (deploy
+  and purge warnings, LOOT notes) stay until closed. Hovering a toast restarts its timer.
 - **Look**: `theme.rs` sets up a dark theme for every system theme (`ctx.set_theme(Dark)`). The
   palette is slate panels with frost-blue (selection, ESM, FOMOD) and gold (Play, Install) accents.
   It also sets square corners, larger spacing and text sizes, and provides helpers: `pill` (tags such as
@@ -411,8 +427,17 @@ gets a red slash, so the icon shows up once the mod is deployed.
 - **Installing**: drag and drop is the only way in. Archives or extracted folders dropped on the
   window go into the install queue.
 - **Settings dialog**: also shows the mods folder with an **Open** button (`xdg-open`).
-- **Right-click a mod**: Rename…, Open folder (`xdg-open`), Remove (asks first, deletes the staging
-  folder).
+- **Mods tab views**: the **Groups** / **Load order** switch on the tab strip sets `Config.mod_view`
+  and saves it. In **Groups** view, each group is a collapsible section in `groups` order, followed by
+  the ungrouped mods. Each section lists its mods in priority order. Dragging a mod into another
+  section changes its priority and moves it into that group. Group headers can move a group up or
+  down, which changes only the display order, and can enable or disable the whole group, limited to
+  search matches. **Load order** view, and **Groups** view when no groups exist, shows one flat list
+  with each mod's group as a small gold label.
+- **Right-click a mod**: Enable / Disable, Rename…, Open folder (`xdg-open`), the group actions, and
+  Remove (asks first, deletes the staging folder). Enable, Disable and the group actions act on the
+  whole selection when the clicked mod is part of it. Ctrl-click toggles a mod in the selection, and
+  shift-click selects a range in on-screen order.
 
 ---
 
@@ -436,6 +461,15 @@ cargo run --example inspect -- a.7z b.zip    # read-only: game setup + installer
 | `loot::markdown_to_plain` | Markdown cleanup of LOOT messages |
 | `fomod::wizard_flow_with_flags` | Defaults, flags, visibility conditions, conditional installs |
 | `deploy::deploy_and_purge_roundtrip` | All three methods, conflict winner, case merge, backups restored |
+| `deploy::stale_copies_are_not_restored` | A leftover `Data` file identical to the mod's isn't backed up or restored; a different one is |
+| `deploy::purge_after_mod_folder_removed` | Purge with each method after the mod's staging folder was deleted: no warnings, files removed, original restored |
+| `mods::groups_add_rename_remove` | Group names trimmed and unique without case, rename carries mods along, remove ungroups |
+| `mods::load_keeps_old_files_and_adopts_groups` | A `modlist.json` from before groups loads, and a group named only by a mod is added back |
+| `mods::conflicts_list_the_other_mods` | Override counts and `winning` / `losing` lists across three mods, case-insensitive paths, disabled mods ignored |
+| `plugins::unmanaged_marking_and_move_out` | Unmanaged marking, and Remove unmanaged moves every case spelling of a plugin |
+| `launch::runners_and_selection` | Steam always offered, SKSE when its loader exists, custom runners, fallback to Steam |
+| `launch::proton_from_config_info` | Compatdata and Proton found from Steam's `config_info`, Proton override setting |
+| `exeicon::reads_embedded_icon` | Icon read from a minimal PE file, non-exe rejected |
 | `end_to_end::fomod_zip_install_and_deploy` | Real zip → detect → wizard → execute → deploy → purge |
 
 `inspect` never writes to the game or Skald's data. It extracts to `$TMPDIR/skald-inspect-<pid>`

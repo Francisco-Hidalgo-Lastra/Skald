@@ -1,13 +1,14 @@
 use crate::install_ui::{GameEnv, InstallRequest, Outcome, Session};
 use crate::theme;
+use crate::toast::{Level, Toasts};
 use egui::{Color32, RichText};
 use egui_extras::Column;
-use skald::config::{self, Config, DeployMethod};
+use skald::config::{self, Config, DeployMethod, ModView};
 use skald::deploy::{Deployer, Report};
 use skald::installer::{self, InstallerKind};
 use skald::launch::{self, CustomRunner, Runner};
 use skald::loot::{self, SortInput, SortOutcome};
-use skald::mods::{self, ModEntry, ModList};
+use skald::mods::{self, Conflicts, ModEntry, ModList};
 use skald::plugins::LoadOrder;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -105,17 +106,23 @@ pub struct App {
     deployer: Deployer,
     load_order: Option<LoadOrder>,
     selection: Selection,
-    conflicts: std::collections::HashMap<String, (usize, usize)>,
+    conflicts: std::collections::HashMap<String, Conflicts>,
+    /// Bytes of each mod's staging folder, keyed by mod name.
+    sizes: std::collections::HashMap<String, u64>,
     job: Option<Job>,
     install: Option<Session>,
     queue: Vec<PathBuf>,
-    log: Vec<(bool, String)>,
+    toasts: Toasts,
     settings: SettingsForm,
     dirty: bool,
     rename: Option<(usize, String)>,
     confirm_remove: Option<usize>,
     confirm_unmanaged: bool,
     group_dialog: Option<GroupDialog>,
+    /// Set by Collapse all / Expand all; applied to every group header on the next frame.
+    set_groups_open: Option<bool>,
+    /// Whether any group header was open last frame, which picks the button's label.
+    any_group_open: bool,
     tab: Tab,
     /// Search text for the mod and plugin lists, kept separately per tab.
     mod_search: String,
@@ -131,9 +138,9 @@ impl App {
         let base = config::data_dir();
         let _ = std::fs::remove_dir_all(base.join("tmp"));
         let cfg = Config::load();
-        let mut log = vec![];
+        let mut toasts = Toasts::default();
         let mods = ModList::load(&base).unwrap_or_else(|e| {
-            log.push((true, format!("Failed to load mod list: {e:#}")));
+            toasts.push(Level::Error, format!("Failed to load mod list: {e:#}"), vec![]);
             ModList { base: base.clone(), ..Default::default() }
         });
         let mut app = Self {
@@ -144,17 +151,20 @@ impl App {
             load_order: None,
             selection: Selection::default(),
             conflicts: Default::default(),
+            sizes: Default::default(),
             job: None,
             install: None,
             tool_icons: Default::default(),
             queue: vec![],
-            log,
+            toasts,
             settings: SettingsForm::default(),
             dirty: false,
             rename: None,
             confirm_remove: None,
             confirm_unmanaged: false,
             group_dialog: None,
+            set_groups_open: None,
+            any_group_open: true,
             tab: Tab::default(),
             mod_search: String::new(),
             plugin_search: String::new(),
@@ -171,10 +181,15 @@ impl App {
     }
 
     fn info(&mut self, s: impl Into<String>) {
-        self.log.push((false, s.into()));
+        self.toasts.push(Level::Info, s, vec![]);
     }
     fn error(&mut self, s: impl Into<String>) {
-        self.log.push((true, s.into()));
+        self.toasts.push(Level::Error, s, vec![]);
+    }
+    /// A toast listing `warnings` under `title`, as a warning if there are any.
+    fn report(&mut self, title: String, warnings: Vec<String>) {
+        let level = if warnings.is_empty() { Level::Info } else { Level::Warn };
+        self.toasts.push(level, title, warnings.into_iter().map(|w| (Level::Warn, w)).collect());
     }
 
     fn open_settings(&mut self) {
@@ -189,9 +204,10 @@ impl App {
         };
     }
 
-    /// Recompute conflicts and the plugin list after the mod list changed.
+    /// Recompute conflicts, sizes and the plugin list after the mod list changed.
     fn refresh(&mut self) {
         self.conflicts = self.mods.conflicts();
+        self.sizes = self.mods.sizes();
         let (Some(game), Some(data), Some(appdata)) = (self.cfg.game_dir.clone(), self.cfg.data_path(), self.cfg.appdata_dir.clone())
         else {
             self.load_order = None;
@@ -386,19 +402,13 @@ impl App {
                 self.mods_changed();
             }
             JobResult::Deployed(r) => {
-                self.info(format!("Deployed {} files ({} existing files backed up)", r.deployed, r.backed_up));
-                for w in r.warnings {
-                    self.error(w);
-                }
+                self.report(format!("Deployed {} files ({} existing files backed up)", r.deployed, r.backed_up), r.warnings);
                 self.dirty = false;
                 self.refresh();
                 self.save_load_order();
             }
             JobResult::Purged(r) => {
-                self.info(format!("Purged {} deployed files; game folder restored", r.deployed));
-                for w in r.warnings {
-                    self.error(w);
-                }
+                self.report(format!("Purged {} deployed files; game folder restored", r.deployed), r.warnings);
                 self.dirty = true;
                 self.refresh();
             }
@@ -414,17 +424,27 @@ impl App {
                     .filter(|p| p.locked)
                     .map(|p| p.name.to_lowercase())
                     .collect();
-                for (plugin, level, text) in outcome.messages.into_iter().filter(|(p, ..)| !locked.contains(&p.to_lowercase())) {
-                    let line = if plugin.is_empty() { format!("LOOT: {text}") } else { format!("LOOT: {plugin}: {text}") };
-                    match level {
-                        loot::Level::Error => self.error(line),
-                        _ => self.info(line),
-                    }
-                }
+                // All of LOOT's notes go in one toast, which stays up until closed.
+                let notes: Vec<(Level, String)> = outcome
+                    .messages
+                    .into_iter()
+                    .filter(|(p, ..)| !locked.contains(&p.to_lowercase()))
+                    .map(|(plugin, level, text)| {
+                        let level = match level {
+                            loot::Level::Error => Level::Error,
+                            loot::Level::Warn => Level::Warn,
+                            loot::Level::Info => Level::Info,
+                        };
+                        (level, if plugin.is_empty() { text } else { format!("{plugin}: {text}") })
+                    })
+                    .collect();
+                let level = notes.iter().map(|(l, _)| *l).max().unwrap_or(Level::Info);
                 if let Some(lo) = &mut self.load_order {
                     lo.apply_order(&outcome.order);
-                    self.info(format!("Sorted {} plugins with LOOT", outcome.order.len()));
+                    self.toasts.push(level, format!("Sorted {} plugins with LOOT", outcome.order.len()), notes);
                     self.save_load_order();
+                } else if !notes.is_empty() {
+                    self.toasts.push(level, "LOOT notes", notes);
                 }
             }
             JobResult::Failed { what, error, temp } => {
@@ -589,9 +609,6 @@ impl App {
     }
 
     fn play(&mut self, runner: &Runner) {
-        if matches!(runner, Runner::Exe { .. }) && !launch::steam_running() {
-            self.error("Steam doesn't seem to be running. Start it first, or the game will close right away.");
-        }
         match launch::launch(&self.cfg, runner) {
             Ok(()) => self.info(format!("Started {}", runner.name())),
             Err(e) => self.error(format!("Couldn't start {}: {e:#}", runner.name())),
@@ -632,18 +649,23 @@ impl App {
         let busy = self.job.is_some();
         let filtering = !self.mod_search.trim().is_empty();
         let q = &self.mod_search;
-        // One section per user group in their order, then the ungrouped mods.
-        let sections: Vec<(Option<String>, Vec<usize>)> = self
-            .mods
-            .groups
-            .iter()
-            .map(|g| Some(g.clone()))
-            .chain([None])
-            .map(|g| {
-                let rows = self.mods.in_group(g.as_deref()).into_iter().filter(|&i| matches_search(&self.mods.mods[i].name, q)).collect();
-                (g, rows)
-            })
-            .collect();
+        let by_group = self.cfg.mod_view == ModView::Groups && !self.mods.groups.is_empty();
+        // Group view: one section per user group in their order, then the ungrouped mods.
+        // Load order view: a single section with every mod.
+        let sections: Vec<(Option<String>, Vec<usize>)> = if by_group {
+            self.mods
+                .groups
+                .iter()
+                .map(|g| Some(g.clone()))
+                .chain([None])
+                .map(|g| {
+                    let rows = self.mods.in_group(g.as_deref()).into_iter().filter(|&i| matches_search(&self.mods.mods[i].name, q)).collect();
+                    (g, rows)
+                })
+                .collect()
+        } else {
+            vec![(None, (0..self.mods.mods.len()).filter(|&i| matches_search(&self.mods.mods[i].name, q)).collect())]
+        };
         if sections.iter().all(|(_, rows)| rows.is_empty()) {
             empty_state(ui, "🔍", "No matching mods", "Nothing in the mod list matches the search.");
             return;
@@ -654,6 +676,8 @@ impl App {
             mods: &mut self.mods.mods,
             groups: &self.mods.groups,
             conflicts: &self.conflicts,
+            sizes: &self.sizes,
+            show_group: !by_group && !self.mods.groups.is_empty(),
             selection: &mut self.selection,
             order: sections.iter().flat_map(|(_, rows)| rows.iter().copied()).collect(),
             busy,
@@ -664,11 +688,13 @@ impl App {
             changed: false,
             action: None,
         };
-        if t.groups.is_empty() {
-            let rows = sections.into_iter().next_back().map(|(_, r)| r).unwrap_or_default();
+        if !by_group {
+            let rows = sections.into_iter().next().map(|(_, r)| r).unwrap_or_default();
             mod_table(ui, &mut t, "mods", &rows, None, true);
         } else {
             let n_groups = t.groups.len();
+            let set_open = self.set_groups_open.take();
+            let mut any_open = false;
             egui::ScrollArea::vertical().id_salt("mods_scroll").auto_shrink([false, false]).show(ui, |ui| {
                 for (gi, (group, rows)) in sections.iter().enumerate() {
                     let total = t.mods.iter().filter(|m| m.group == *group).count();
@@ -683,8 +709,9 @@ impl App {
                     let r = egui::CollapsingHeader::new(RichText::new(header).strong().color(theme::TEXT))
                         .id_salt(&salt)
                         .default_open(true)
-                        .open(filtering.then_some(!rows.is_empty()))
+                        .open(if filtering { Some(!rows.is_empty()) } else { set_open })
                         .show_unindented(ui, |ui| mod_table(ui, &mut t, &salt, rows, group.as_deref(), false));
+                    any_open |= r.openness > 0.5;
                     r.header_response.context_menu(|ui| {
                         let mut act = None;
                         if let Some(g) = group {
@@ -718,6 +745,7 @@ impl App {
                     });
                 }
             });
+            self.any_group_open = any_open;
         }
         let (drop_to, mut changed, action) = (t.drop_to, t.changed, t.action);
         let mut regroup = false;
@@ -729,7 +757,7 @@ impl App {
                     && to < self.mods.mods.len()
                 {
                     // Dropping into another group's section also moves the mod into that group.
-                    if self.mods.mods[from].group != group {
+                    if by_group && self.mods.mods[from].group != group {
                         self.mods.mods[from].group = group;
                         regroup = true;
                     }
@@ -773,6 +801,13 @@ impl App {
             Some(ModAction::EnableGroup(g, on)) => {
                 let q = &self.mod_search;
                 for m in self.mods.mods.iter_mut().filter(|m| m.group == g && matches_search(&m.name, q)) {
+                    changed |= m.enabled != on;
+                    m.enabled = on;
+                }
+            }
+            Some(ModAction::SetEnabled(targets, on)) => {
+                for i in targets {
+                    let m = &mut self.mods.mods[i];
                     changed |= m.enabled != on;
                     m.enabled = on;
                 }
@@ -846,6 +881,25 @@ impl App {
                 {
                     self.group_dialog = Some(GroupDialog { name: String::new(), renaming: None, assign: vec![] });
                 }
+                if self.tab == Tab::Mods && self.cfg.mod_view == ModView::Groups && !self.mods.groups.is_empty() {
+                    let label = if self.any_group_open { "Collapse all" } else { "Expand all" };
+                    let searching = !self.mod_search.trim().is_empty();
+                    let r = ui.add_enabled(!searching, egui::Button::new(RichText::new(label).small()));
+                    if r.on_disabled_hover_text("Groups open by themselves while searching").clicked() {
+                        self.set_groups_open = Some(!self.any_group_open);
+                    }
+                }
+                if self.tab == Tab::Mods {
+                    // Right-to-left layout, so Groups is added first to sit on the right.
+                    ui.add_space(8.0);
+                    let mut view = self.cfg.mod_view;
+                    ui.selectable_value(&mut view, ModView::Groups, RichText::new("Groups").small()).on_hover_text("Mods sorted into their groups");
+                    ui.selectable_value(&mut view, ModView::LoadOrder, RichText::new("Load order").small()).on_hover_text("Every mod in one list, in priority order");
+                    if view != self.cfg.mod_view {
+                        self.cfg.mod_view = view;
+                        self.save_config();
+                    }
+                }
                 if self.tab == Tab::Plugins {
                     let unmanaged = self.unmanaged_plugins().len();
                     if ui
@@ -864,9 +918,10 @@ impl App {
                     }
                 }
                 ui.add_space(8.0);
+                let on_disk = format_size(self.sizes.values().sum());
                 let summary = match self.tab {
-                    Tab::Mods if self.mods.groups.is_empty() => format!("{enabled} of {} enabled  ·  lower in the list wins conflicts", self.mods.mods.len()),
-                    Tab::Mods => format!("{enabled} of {} enabled  ·  higher # wins conflicts", self.mods.mods.len()),
+                    Tab::Mods if self.mods.groups.is_empty() || self.cfg.mod_view == ModView::LoadOrder => format!("{enabled} of {} enabled  ·  {on_disk} on disk  ·  lower in the list wins conflicts", self.mods.mods.len()),
+                    Tab::Mods => format!("{enabled} of {} enabled  ·  {on_disk} on disk  ·  higher # wins conflicts", self.mods.mods.len()),
                     Tab::Plugins if self.load_order.is_some() => format!("{active} active  ·  {} full, {light} light", active - light),
                     Tab::Plugins => String::new(),
                 };
@@ -983,19 +1038,6 @@ impl App {
         if let Some(s) = &m.source {
             ui.add(egui::Label::new(RichText::new(s).small().color(theme::TEXT_WEAK)).truncate());
         }
-    }
-
-    fn log_view(&self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for (err, line) in &self.log {
-                ui.horizontal(|ui| {
-                    let (icon, color, text) = if *err { ("✖", theme::RED, theme::RED) } else { ("›", theme::FROST, theme::TEXT_WEAK) };
-                    ui.label(RichText::new(icon).monospace().color(color));
-                    ui.add(egui::Label::new(RichText::new(line).monospace().color(text)).wrap());
-                });
-            }
-        });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1314,13 +1356,11 @@ impl eframe::App for App {
         // No margin, so the buttons sit flush against the edges of the bar.
         let top_frame = egui::Frame::NONE.fill(theme::BG_DEEP).stroke(egui::Stroke::new(1.0, theme::BORDER));
         egui::Panel::top("top").frame(top_frame).show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("log").resizable(true).default_size(150.0).frame(theme::panel_frame(theme::BG_DEEP)).show(ui, |ui| {
+        let details = egui::Panel::bottom("details").resizable(false).frame(theme::panel_frame(theme::BG_DEEP)).show(ui, |ui| {
             theme::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.details(ui);
             });
-            ui.add_space(6.0);
-            self.log_view(ui);
         });
         egui::CentralPanel::default().frame(theme::panel_frame(theme::PANEL)).show(ui, |ui| {
             self.tab_bar(ui);
@@ -1334,6 +1374,7 @@ impl eframe::App for App {
             drop_overlay(&ctx);
         }
         self.dialogs(&ctx);
+        self.toasts.show(&ctx, details.response.rect.height() + 14.0);
     }
 }
 
@@ -1481,6 +1522,8 @@ enum ModAction {
     MoveGroup(usize, bool),
     /// Enable/disable every (search-matching) mod in a group; None = the ungrouped mods.
     EnableGroup(Option<String>, bool),
+    /// Enable/disable these mods.
+    SetEnabled(Vec<usize>, bool),
 }
 
 /// Name prompt for creating or renaming a mod group.
@@ -1496,7 +1539,10 @@ struct GroupDialog {
 struct ModTable<'a> {
     mods: &'a mut [ModEntry],
     groups: &'a [String],
-    conflicts: &'a std::collections::HashMap<String, (usize, usize)>,
+    conflicts: &'a std::collections::HashMap<String, Conflicts>,
+    sizes: &'a std::collections::HashMap<String, u64>,
+    /// Show each mod's group next to its name (the load order view).
+    show_group: bool,
     selection: &'a mut Selection,
     /// Every visible mod row in on-screen order, across all sections.
     order: Vec<usize>,
@@ -1534,6 +1580,7 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
         .column(Column::initial(110.0).at_least(70.0).resizable(single))
         .column(Column::initial(90.0).at_least(50.0).resizable(single))
         .column(Column::initial(90.0).at_least(70.0))
+        .column(Column::exact(72.0))
         .column(Column::exact(52.0));
     let body = |body: egui_extras::TableBody| {
         body.rows(ROW_H, rows.len(), |mut row| {
@@ -1552,6 +1599,11 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
                 ui.label(RichText::new(format!("{i}")).monospace().color(theme::TEXT_WEAK)).on_hover_text("Priority: higher numbers win file conflicts");
             });
             row.col(|ui| {
+                if t.show_group
+                    && let Some(g) = &m.group
+                {
+                    ui.label(RichText::new(g).small().color(theme::GOLD)).on_hover_text("Group");
+                }
                 let text = RichText::new(&m.name);
                 ui.add(egui::Label::new(if m.enabled { text.color(theme::TEXT) } else { text.color(theme::TEXT_WEAK) }).selectable(false).truncate());
             });
@@ -1564,14 +1616,24 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
                 ui.label(RichText::new(m.version.as_deref().unwrap_or("")).color(theme::TEXT_WEAK));
             });
             row.col(|ui| {
-                if let Some((over, under)) = t.conflicts.get(&m.name) {
+                if let Some(c) = t.conflicts.get(&m.name) {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if *over > 0 {
-                        ui.label(RichText::new(format!("▲{over}")).color(theme::GREEN)).on_hover_text(format!("Overrides {over} files from lower-priority mods"));
-                    }
-                    if *under > 0 {
-                        ui.label(RichText::new(format!("▼{under}")).color(theme::RED)).on_hover_text(format!("{under} files overridden by higher-priority mods"));
-                    }
+                    let r = ui
+                        .horizontal(|ui| {
+                            if c.overrides > 0 {
+                                ui.label(RichText::new(format!("▲{}", c.overrides)).color(theme::GREEN));
+                            }
+                            if c.overridden > 0 {
+                                ui.label(RichText::new(format!("▼{}", c.overridden)).color(theme::RED));
+                            }
+                        })
+                        .response;
+                    r.on_hover_ui(|ui| conflicts_tooltip(ui, c));
+                }
+            });
+            row.col(|ui| {
+                if let Some(&b) = t.sizes.get(&m.name) {
+                    ui.label(RichText::new(format_size(b)).color(theme::TEXT_WEAK));
                 }
             });
             row.col(|ui| {
@@ -1609,9 +1671,19 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
             }
             let current = t.mods[i].group.clone();
             r.context_menu(|ui| {
-                // Group actions apply to the whole selection when the clicked mod is part of it.
+                // Enable/disable and group actions apply to the whole selection when the clicked mod is part of it.
                 let targets: Vec<usize> = if t.selection.contains(i) { t.selection.set.iter().copied().collect() } else { vec![i] };
                 let mut act = None;
+                let n = if targets.len() > 1 { format!(" {} mods", targets.len()) } else { String::new() };
+                let any_off = targets.iter().any(|&j| !t.mods[j].enabled);
+                let any_on = targets.iter().any(|&j| t.mods[j].enabled);
+                if ui.add_enabled(!t.busy && any_off, egui::Button::new(format!("✔  Enable{n}"))).clicked() {
+                    act = Some(ModAction::SetEnabled(targets.clone(), true));
+                }
+                if ui.add_enabled(!t.busy && any_on, egui::Button::new(format!("✖  Disable{n}"))).clicked() {
+                    act = Some(ModAction::SetEnabled(targets.clone(), false));
+                }
+                ui.separator();
                 if ui.button("✏  Rename…").clicked() {
                     act = Some(ModAction::Rename(i));
                 }
@@ -1648,7 +1720,7 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
     if single {
         table
             .header(26.0, |mut h| {
-                for title in ["", "#", "NAME", "INSTALLER", "VERSION", "CONFLICTS", ""] {
+                for title in ["", "#", "NAME", "INSTALLER", "VERSION", "CONFLICTS", "SIZE", ""] {
                     h.col(|ui| {
                         ui.label(RichText::new(title).small().strong().color(theme::TEXT_WEAK));
                     });
@@ -1657,5 +1729,42 @@ fn mod_table(ui: &mut egui::Ui, t: &mut ModTable, salt: &str, rows: &[usize], gr
             .body(body);
     } else {
         table.body(body);
+    }
+}
+
+/// Bytes as a short human-readable size, e.g. "1.4 GB".
+fn format_size(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{b} B") } else if v < 10.0 { format!("{v:.1} {}", UNITS[u]) } else { format!("{v:.0} {}", UNITS[u]) }
+}
+
+/// Hover text for a mod's conflicts cell: which mods it overrides and which override it.
+fn conflicts_tooltip(ui: &mut egui::Ui, c: &Conflicts) {
+    let files = |n: usize| if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+    let list = |ui: &mut egui::Ui, mods: &[(String, usize)], color: Color32| {
+        egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+            for (name, n) in mods {
+                ui.label(RichText::new(name).color(color));
+                ui.label(RichText::new(files(*n)).color(theme::TEXT_WEAK));
+                ui.end_row();
+            }
+        });
+    };
+    if !c.winning.is_empty() {
+        ui.label(RichText::new(format!("▲ Overrides {} from:", files(c.overrides))).strong());
+        list(ui, &c.winning, theme::GREEN);
+    }
+    if !c.winning.is_empty() && !c.losing.is_empty() {
+        ui.add_space(6.0);
+    }
+    if !c.losing.is_empty() {
+        ui.label(RichText::new(format!("▼ {} overridden by:", files(c.overridden))).strong());
+        list(ui, &c.losing, theme::RED);
     }
 }

@@ -23,14 +23,15 @@ through Proton. You don't need Wine tricks or Windows tools.
 Open a terminal and run:
 
 ```sh
-cd ~/Projects/skald
+git clone https://github.com/Francisco-Hidalgo-Lastra/Skald.git
+cd Skald
 cargo run --release
 ```
 
 The first start takes a few minutes while it builds. After that it opens straight away.
 
-Skald finds Skyrim by itself, including on extra Steam drives and Flatpak Steam. The log at the
-bottom of the window says where it found the game. If it says **"Skyrim Special Edition was not
+Skald finds Skyrim by itself, including on extra Steam drives and Flatpak Steam. A message in the
+bottom-right corner says where it found the game. If it says **"Skyrim Special Edition was not
 found"**, open **⚙ Settings**, click **Browse…** and pick the folder that contains `SkyrimSE.exe`.
 
 ---
@@ -133,15 +134,19 @@ you can fold open or closed by clicking the group's title: **Base game & DLC** (
 - **Sort (LOOT)** (top right) puts your plugins in a good load order using
   [LOOT](https://loot.github.io)'s rules. Skald fetches the latest rules from the internet each time,
   so you need a connection the first time (later it uses the saved copy if you're offline). LOOT's
-  notes, such as a plugin that needs cleaning or a missing requirement, show up in the log at the
-  bottom. You can still move plugins by hand afterwards. Notes about the base game and Creation Club
+  notes, such as a plugin that needs cleaning or a missing requirement, show up in a message in the
+  bottom-right corner. You can still move plugins by hand afterwards. Notes about the base game and Creation Club
   plugins are left out, because you can't change those here.
 
 Plugin changes are saved **straight away**, with no Deploy needed. New mods' plugins are switched
 on automatically.
 
 ### Bottom panel
-Shows details of the selected mod and a log of what Skald did. Errors are shown in red.
+Shows details of the selected mod.
+
+### Messages
+What Skald did shows up as messages in the bottom-right corner. Plain messages disappear after a
+few seconds. Errors, warnings and LOOT notes stay until you close them with **✖**.
 
 ---
 
@@ -188,8 +193,8 @@ Install `unrar` (see [What you need](#what-you-need)).
 
 **How do I use SKSE?**
 Install the SKSE archive like any other mod (Skald recognises it) and deploy. Then open the small
-menu next to **Play** and pick **SKSE**. From then on, Play starts the game through SKSE. Keep
-Steam running: Skyrim needs it.
+menu next to **Play** and pick **SKSE**. From then on, Play starts the game through SKSE. Open
+Steam first: Skyrim needs it, and Play refuses to start Steam or SKSE while Steam is closed.
 
 **Can Play start something else, like xEdit or BodySlide?**
 For tools like these, use the [tools tray](#tools-tray): click **+** next to **Purge**.

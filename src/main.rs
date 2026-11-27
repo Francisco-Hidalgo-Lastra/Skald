@@ -1,6 +1,7 @@
 mod app;
 mod install_ui;
 mod theme;
+mod toast;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

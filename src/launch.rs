@@ -33,6 +33,14 @@ impl Runner {
             Runner::Exe { name, .. } => name,
         }
     }
+
+    /// Steam and SKSE start Skyrim, which exits right away without the Steam client.
+    pub fn needs_steam(&self) -> bool {
+        match self {
+            Runner::Steam => true,
+            Runner::Exe { name, .. } => name == SKSE,
+        }
+    }
 }
 
 /// Steam, then SKSE if its loader is in the game folder, then custom programs.
@@ -122,7 +130,12 @@ pub fn steam_running() -> bool {
 }
 
 /// Start the game with `runner`. Returns once the process has been spawned.
+/// Refuses to start a runner that needs Steam when Steam isn't running,
+/// because `steam://` would open Steam instead.
 pub fn launch(cfg: &Config, runner: &Runner) -> Result<()> {
+    if runner.needs_steam() && !steam_running() {
+        bail!("Steam isn't running. Open Steam first, then press Play again.");
+    }
     match runner {
         Runner::Steam => {
             Command::new("xdg-open")
@@ -185,6 +198,9 @@ mod tests {
         assert_eq!(selected(&cfg), Runner::Exe { name: SKSE.into(), exe: game.join("SKSE64_Loader.exe") });
         cfg.runner = Some("gone".into());
         assert_eq!(selected(&cfg), Runner::Steam);
+
+        let needs: Vec<_> = runners(&cfg).iter().map(Runner::needs_steam).collect();
+        assert_eq!(needs, [true, true, false]);
     }
 
     #[test]
